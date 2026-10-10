@@ -907,6 +907,7 @@ typedef struct {
      * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
     double t_disk;
     uint8_t **ehit;
+    uint32_t **ehcount;       /* cumulativo (non azzerato come ehit): bitlen -> heat EMAP */
     float **K, **V; int kv_len, max_t, kv_cap;
     /* What the current attention and DeltaNet state was built from, so a
      * turn that resends the transcript prefills only the new tail. The ids
@@ -2818,13 +2819,24 @@ static void ehit_mark(Model *m, int layer, int eid){
         pthread_mutex_lock(&g_ehit_mx);
         ehit=m->ehit;
         if(!ehit){
+            /* Contatore cumulativo per l'heat dell'EMAP: allocato qui, sotto
+             * lo stesso lock, e pubblicato PRIMA di m->ehit -- chi legge ehit
+             * con acquire vede anche ehcount. A differenza di ehit non viene
+             * mai azzerato da hits_emit: l'heat della dashboard e' per run. */
+            uint32_t **ehc=calloc((size_t)c->n_layers,sizeof(uint32_t*));
+            for(int i=0;i<c->n_layers;i++) ehc[i]=calloc((size_t)c->n_experts,sizeof(uint32_t));
             ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
             for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehcount,ehc,__ATOMIC_RELEASE);
             __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&g_ehit_mx);
     }
-    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts){
+        ehit[layer][eid]=1;
+        uint32_t **ehc=__atomic_load_n(&m->ehcount,__ATOMIC_ACQUIRE);
+        if(ehc) __atomic_add_fetch(&ehc[layer][eid],1,__ATOMIC_RELAXED);
+    }
 }
 /* hold=1 marks the slot busy before the lock drops, so nothing can evict it
  * between this lookup and the caller's slot_release. */
@@ -5288,9 +5300,14 @@ static void emap_emit(Model *m){
      * and the gateway stops its dispatcher on a line it cannot parse (#1757). */
     if(cols==0) return;
     uint8_t *cells=calloc((size_t)rows*cols,1);
+    uint32_t **ehc=__atomic_load_n(&m->ehcount,__ATOMIC_ACQUIRE);
     pthread_mutex_lock(&g_pilot_mx);
-    for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
-        cells[(size_t)i*cols+e]=(uint8_t)((vkt_resident(i,e)?2:slot_indexed(m,i,e)?1:0)<<6);   /* 2 = on the Vulkan device */
+    for(int i=0;i<rows;i++) for(int e=0;e<cols;e++){
+        int tier=vkt_resident(i,e)?2:slot_indexed(m,i,e)?1:0;   /* 2 = on the Vulkan device */
+        uint32_t n=ehc?ehc[i][e]:0;
+        int heat=0; for(uint32_t u=n;u;u>>=1) heat++; if(heat>63) heat=63;
+        cells[(size_t)i*cols+e]=(uint8_t)(((tier&3)<<6)|(heat&63));
+    }
     pthread_mutex_unlock(&g_pilot_mx);
     char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
